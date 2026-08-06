@@ -227,6 +227,87 @@ def compare(a: dict, b: dict, names, label: str, verbose_names=()):
 
 
 # --------------------------------------------------------------------------- #
+
+def _t6() -> None:
+    """SONIC's Humanoid_Batch must yield a 27-wide dof_pos for H1-2.
+
+    This is the head_aux question, settled numerically on upstream's own code
+    rather than by argument.  fk_batch derives dof_pos two ways:
+
+        extend_config non-empty : pose[..., 1 : num_bodies]        (naive slice)
+        extend_config empty     : pose[..., actuated_joints_idx]   (if that list
+                                  is shorter than body_names) else pose[..., 1:]
+
+    Both assume every non-root body owns exactly one DOF.  Our canonical
+    ProtoMotions asset has 29 bodies / 27 DOF because ``head_aux`` is a massless
+    marker with no joint, so BOTH branches return 28 -- and the actuated_joints_idx
+    branch is worse than off-by-one, because body_to_joint also picks up pelvis
+    (it owns the free joint), so slot 0 is the root. Every DOF would be shifted.
+
+    Dropping head_aux from the SONIC asset (28 bodies / 27 DOF) makes both
+    branches correct, and only then does extend_config become usable: it restores
+    head_aux as an augmented body (num_bodies_augment 29) while dof_pos stays 27.
+    """
+    try:
+        import types  # noqa: PLC0415
+
+        for _m in ("open3d", "open3d.geometry", "open3d.utility", "open3d.io"):
+            if _m not in sys.modules:
+                sys.modules[_m] = types.ModuleType(_m)
+        sys.modules["open3d"].io = sys.modules["open3d.io"]
+        sys.modules["open3d"].geometry = sys.modules["open3d.geometry"]
+        sys.modules["open3d"].utility = sys.modules["open3d.utility"]
+        sys.modules["open3d.io"].read_triangle_mesh = lambda *a, **k: types.SimpleNamespace(
+            vertices=[], triangles=[]
+        )
+        from easydict import EasyDict  # noqa: PLC0415
+
+        sys.path.insert(0, str(REPO_ROOT))
+        from gear_sonic.utils.motion_lib.torch_humanoid_batch import (  # noqa: PLC0415
+            Humanoid_Batch,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[SKIP] Humanoid_Batch unavailable ({type(exc).__name__}: {exc})")
+        _FAILURES.append("T6 skipped: Humanoid_Batch deps unavailable")
+        return
+
+    head = [
+        EasyDict(
+            {
+                "joint_name": "head_aux",
+                "parent_name": "torso_link",
+                "pos": [0.0, 0.0, 0.7],
+                "rot": [1.0, 0.0, 0.0, 0.0],
+            }
+        )
+    ]
+
+    def dof_width(root: str, fname: str, extend):
+        h = Humanoid_Batch(EasyDict({"asset": {"assetRoot": root, "assetFileName": fname},
+                                     "extend_config": extend}))
+        if len(extend) > 0:
+            w = h.num_bodies - 1
+        elif len(h.actuated_joints_idx) != len(h.body_names):
+            w = len(h.actuated_joints_idx)
+        else:
+            w = h.num_bodies - 1
+        return h, w
+
+    sonic_root = str(REPO_ROOT / "gear_sonic/data/assets/robot_description/mjcf") + "/"
+    for extend, tag in [([], "extend_config=[]"), (head, "extend_config=[head_aux]")]:
+        h, w = dof_width(sonic_root, "h1_2.xml", extend)
+        print(f"   shipped 28-body asset, {tag}: num_bodies={h.num_bodies} "
+              f"augment={h.num_bodies_augment} dof_pos_width={w}")
+        check(w == 27, f"shipped asset with {tag} yields 27-wide dof_pos")
+    if CANONICAL_MJCF.exists():
+        canon_root = str(CANONICAL_MJCF.parent) + "/"
+        for extend, tag in [([], "extend_config=[]"), (head, "extend_config=[head_aux]")]:
+            h, w = dof_width(canon_root, CANONICAL_MJCF.name, extend)
+            print(f"   29-body head_aux asset, {tag}: num_bodies={h.num_bodies} "
+                  f"augment={h.num_bodies_augment} dof_pos_width={w}")
+            check(w == 28, f"29-body asset with {tag} yields 28 (documents WHY head_aux is dropped)")
+
+
 def main() -> int:
     rng = np.random.default_rng(20260806)
     tables = _load_tables()
@@ -365,6 +446,9 @@ def main() -> int:
         d = float(np.abs(back_pos - ref_pos).max())
         print(f"   pose {i}: max |dp| = {d:.3e} m")
         check(d < POS_TOL, f"pose {i}: full Isaac->MuJoCo->Isaac body pipeline is identity")
+
+    print("\n=== T6: Humanoid_Batch dof_pos width (head_aux / extend_config) ===")
+    _t6()
 
     print("\n" + "=" * 72)
     if _FAILURES:

@@ -75,6 +75,18 @@ manager_env:
         smpl_y_up: true
         asset:
           assetFileName: "h1_2.xml"
+        # head_aux: our canonical asset carries a massless marker body at
+        # torso_link + (0,0,0.7). It is NOT a body in h1_2.xml, because SONIC's
+        # fk_batch assumes every non-root body owns one DOF and a 29-body/27-DOF
+        # robot yields a 28-wide (and root-shifted) dof_pos in BOTH of its
+        # branches -- measured, see tests/test_h1_2_embodiment.py::T6.
+        # robots/h1_2.py exports H1_2_HEAD_EXTEND_CONFIG, which restores it as an
+        # augmented body while keeping dof_pos at 27. Left EMPTY for now because
+        # motion_lib_base.py:1506-1507 has the global_translation_extend
+        # consumption commented out upstream, so enabling it would widen
+        # num_bodies_augment (28 -> 29), and every aux-loss decoder/normalizer
+        # with it, while delivering no head data. Turn on together with that.
+        extend_config: []
 
 algo:
   config:

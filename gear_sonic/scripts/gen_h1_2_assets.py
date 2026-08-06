@@ -226,9 +226,15 @@ def write_mjcf(source: Path, out: Path, drop: tuple[str, ...], with_meshes: bool
         # No STLs shipped -> drop the mesh assets and the (visual-only,
         # contype=0) mesh geoms so the file actually compiles in MuJoCo and
         # corresponds exactly, geom for geom, to the generated URDF.
+        # Keep an EMPTY <asset/> rather than removing it: SONIC's
+        # Humanoid_Batch.load_mesh() does xml_doc_root.find("asset").findall(".//mesh")
+        # and crashes with AttributeError on a missing <asset>. With zero <mesh>
+        # children it degrades cleanly (empty mesh dicts; only mesh_fk/visualisation
+        # uses them -- fk_batch does not).
         asset = root.find("asset")
         if asset is not None:
-            root.remove(asset)
+            for child in list(asset):
+                asset.remove(child)
         for parent in root.iter():
             for child in list(parent):
                 if child.tag == "geom" and child.get("type") == "mesh":

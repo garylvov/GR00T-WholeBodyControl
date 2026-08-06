@@ -56,11 +56,30 @@ ASSET_DIR = "gear_sonic/data/assets"
 # G1/H2/X2 is only the per-joint ARMATURE (H1-2 uses different motors), which is
 # exactly the quantity the guide says to take from the robot's own datasheet.
 #
-# NOT adopted here (see the handoff notes): the experimental S1 fork's
-# ``PM_ARM_KP=40 PM_ARM_KD=2.0`` arm override, and the "shoulder 120 / elbow 120
-# / wrist 30" effort limits.  Neither appears in the checked-in H1-2 config; the
-# effort limits below are the ones our MJCF and robot config both carry.
+# ARM GROUP = PRODUCTION VALUES, NOT THE CHECKED-IN DEFAULTS.
+# Our ProtoMotions ``robot_configs/h1_2.py`` computes the arm group through
+# env gates (``PM_ARM_KP``/``PM_ARM_KD``/``PM_ARM_EFFORT_<GROUP>``) whose
+# in-file defaults (KP 19.74, KD 1.26, effort 40/18/18/19) are the *unconfigured
+# fallback*.  Our canonical launcher always sets them, and the live v58 teacher
+# (``mm_logs/canonical_teacher_20260806_v58/launch_v58.sh``) is training right
+# now with KP 40, KD 2.0, shoulder 120, elbow 120, wrist 30.  Those production
+# values are what is baked in below, so the SONIC robot matches the teacher we
+# will be comparing against.
+#
+# Note ``_arm_effort("SHOULDER", 18)`` supplies shoulder *yaw* as well, and it
+# reads the same ``PM_ARM_EFFORT_SHOULDER``.  So production gives shoulder yaw
+# 120 too -- not the 18 N-m default.  Mirrored exactly here rather than invented.
+#
+# KNOWN DISCREPANCY (recorded deliberately, do not "fix" silently): production's
+# arm triple no longer satisfies SONIC's own KP/KD/armature formulas.  With
+# armature 0.005 the formula gives KP 19.74 / KD 1.26; with KP pinned at 40 the
+# implied armature is 0.010133 and the zeta=2.0 damping would be 2.547.
+# Production runs KD 2.0 against armature 0.005 -- i.e. zeta ~= 3.18 w.r.t. the
+# declared armature, or ~1.57 w.r.t. the KP-implied armature.  Kept at 2.0 for
+# comparability with the teacher.
 # --------------------------------------------------------------------------- #
+import os
+
 NATURAL_FREQ = 10 * 2.0 * 3.1415926535  # 10 Hz
 DAMPING_RATIO = 2.0
 
@@ -79,11 +98,42 @@ DAMPING_200 = 2.0 * DAMPING_RATIO * ARMATURE_200 * NATURAL_FREQ
 DAMPING_60 = 2.0 * DAMPING_RATIO * ARMATURE_60 * NATURAL_FREQ
 DAMPING_40 = 2.0 * DAMPING_RATIO * ARMATURE_40 * NATURAL_FREQ
 
+# --- arm group: production values, with the same env gates our launcher uses,
+# so a SONIC run under the canonical launcher env stays identical to the teacher.
+def _arm_effort(group: str, production: float) -> float:
+    v = os.environ.get(f"PM_ARM_EFFORT_{group}") or os.environ.get("PM_ARM_EFFORT")
+    return float(v) if v else production
+
+
+ARM_STIFFNESS = float(os.environ.get("PM_ARM_KP") or 40.0)
+ARM_DAMPING = float(os.environ.get("PM_ARM_KD") or 2.0)
+ARM_ARMATURE = float(os.environ.get("PM_ARM_ARMATURE") or ARMATURE_40)
+ARM_EFFORT_SHOULDER_PR = _arm_effort("SHOULDER", 120.0)
+ARM_EFFORT_SHOULDER_YAW = _arm_effort("SHOULDER", 120.0)  # same gate as SHOULDER_PR
+ARM_EFFORT_ELBOW = _arm_effort("ELBOW", 120.0)
+ARM_EFFORT_WRIST = _arm_effort("WRIST", 30.0)
+
 # H1-2 has no head link: the head is a fixed collision capsule on ``torso_link``
 # and our canonical MJCF marks its frame with a massless ``head_aux`` body at
 # this offset in the torso frame.  Kept so head-referenced terms can be written
 # as torso_link + offset instead of needing a body that Isaac would merge away.
 H1_2_HEAD_OFFSET_IN_TORSO = (0.0, 0.0, 0.7)
+
+# SONIC's own mechanism for virtual/marker bodies.  Measured, and verified to
+# keep fk_batch's dof_pos at 27 on this 28-body asset (see
+# tests/test_h1_2_embodiment.py::T6).  Left DISABLED in sonic_h1_2.yaml because
+# motion_lib_base.py:1506-1507 has the `global_translation_extend` consumption
+# commented out upstream, so today it would deliver no head data while still
+# widening `num_bodies_augment` to 29 and thus every aux-loss decoder/normalizer.
+# Wire it in when the extended-body consumption is enabled.
+H1_2_HEAD_EXTEND_CONFIG = [
+    {
+        "joint_name": "head_aux",
+        "parent_name": "torso_link",
+        "pos": list(H1_2_HEAD_OFFSET_IN_TORSO),
+        "rot": [1.0, 0.0, 0.0, 0.0],
+    }
+]
 
 # ==== BEGIN GENERATED: gear_sonic/scripts/gen_h1_2_order_tables.py ==========
 H1_2_ISAACLAB_JOINTS = [
@@ -270,18 +320,18 @@ H1_2_CFG = ArticulationCfg(
                 ".*_wrist_yaw_joint",
             ],
             effort_limit_sim={
-                ".*_shoulder_pitch_joint": 40.0,
-                ".*_shoulder_roll_joint": 40.0,
-                ".*_shoulder_yaw_joint": 18.0,
-                ".*_elbow_joint": 18.0,
-                ".*_wrist_roll_joint": 19.0,
-                ".*_wrist_pitch_joint": 19.0,
-                ".*_wrist_yaw_joint": 19.0,
+                ".*_shoulder_pitch_joint": ARM_EFFORT_SHOULDER_PR,
+                ".*_shoulder_roll_joint": ARM_EFFORT_SHOULDER_PR,
+                ".*_shoulder_yaw_joint": ARM_EFFORT_SHOULDER_YAW,
+                ".*_elbow_joint": ARM_EFFORT_ELBOW,
+                ".*_wrist_roll_joint": ARM_EFFORT_WRIST,
+                ".*_wrist_pitch_joint": ARM_EFFORT_WRIST,
+                ".*_wrist_yaw_joint": ARM_EFFORT_WRIST,
             },
             velocity_limit_sim=50.0,
-            stiffness=STIFFNESS_40,
-            damping=DAMPING_40,
-            armature=ARMATURE_40,
+            stiffness=ARM_STIFFNESS,
+            damping=ARM_DAMPING,
+            armature=ARM_ARMATURE,
         ),
     },
 )
