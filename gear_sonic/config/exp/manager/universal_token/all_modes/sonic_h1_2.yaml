@@ -1,0 +1,128 @@
+# @package _global_
+# ADDED BY imprint (glvov).
+# SONIC H1-2 config -- 3 encoders (G1/motion tracking, teleop, SMPL) for the
+# Unitree **H1-2** (28 bodies, 27 DOF).  NOT the Unitree H2 (see sonic_h2.yaml).
+# Based on sonic_h2.yaml, itself based on sonic_release.yaml.
+
+defaults:
+  - /algo: ppo_im_phc
+  - /manager_env: base_env
+  - /callbacks/read_eval
+  - /callbacks/im_resample
+  - /aux_losses: universal_token/g1_recon_and_all_latent
+  - override /trainer: trl_ppo_aux
+  - override /actor_critic: universal_token/all_mlp_v1
+  - override /manager_env/observations/tokenizer: unitoken_all_noz
+  - override /manager_env/observations/policy: local_dir_hist
+  - override /manager_env/observations/critic: privileged_mf_hist
+  - override /manager_env/events: tracking/level0_4
+  - override /manager_env/terminations: tracking/base_adaptive_strict_ori_foot_xyz
+  - override /manager_env/rewards: tracking/base_5point_local_feet_acc
+
+use_manager_env: true
+
+exp_base: ${hydra:runtime.choices.exp}
+exp_var: test
+experiment_name: ${exp_base}_${exp_var}
+experiment_dir: ${base_dir}/${project_name}/${experiment_name}-${timestamp}
+
+num_envs: 4096
+project_name: TRL_H1_2_Track
+
+actor_prop_history_length: 10
+actor_actions_history_length: 10
+
+critic_prop_history_length: 10
+critic_actions_history_length: 10
+
+manager_env:
+  rewards:
+    # BODY-NAME OVERRIDE (the only one H1-2 needs).
+    # The shared term defaults to ["left_wrist_yaw_link", "right_wrist_yaw_link",
+    # "head_link"].  H1-2 has no head link at all: its head is a fixed collision
+    # capsule welded to torso_link, so torso_link's angular velocity *is* the
+    # head's.  Every other G1 body name in the shared configs exists verbatim on
+    # H1-2 (pelvis, {left,right}_{hip_roll,knee,ankle_roll,shoulder_roll,elbow,
+    # wrist_yaw}_link, torso_link) -- verified against H1_2_ISAACLAB_JOINTS.
+    anti_shake_ang_vel:
+      params:
+        body_names: ["left_wrist_yaw_link", "right_wrist_yaw_link", "torso_link"]
+    feet_acc:
+      weight: -2.5e-6
+  config:
+    robot:
+      type: h1_2
+    terrain_type: trimesh
+  commands:
+    motion:
+      reward_point_body: ["torso_link", "left_wrist_yaw_link", "right_wrist_yaw_link"]
+      reward_point_body_offset: [[0.0, 0.0, 0.5], [0.0, -0.0, 0.0], [0.0, -0.0, 0.0]]
+      num_future_frames: 10
+      dt_future_ref_frames: 0.1
+      smpl_num_future_frames: 10
+      smpl_dt_future_ref_frames: 0.02
+      cat_upper_body_poses: true
+      cat_upper_body_poses_prob: 0.5
+
+      freeze_frame_aug: true
+      teleop_sample_prob_when_smpl: 0.5
+
+      motion_lib_cfg:
+        adaptive_sampling:
+          adp_samp_failure_rate_max_over_mean: 200
+        motion_file: null      # provide on the command line
+        smpl_motion_file: dummy
+        smpl_y_up: true
+        asset:
+          assetFileName: "h1_2.xml"
+        # head_aux: our canonical asset carries a massless marker body at
+        # torso_link + (0,0,0.7). It is NOT a body in h1_2.xml, because SONIC's
+        # fk_batch assumes every non-root body owns one DOF and a 29-body/27-DOF
+        # robot yields a 28-wide (and root-shifted) dof_pos in BOTH of its
+        # branches -- measured, see tests/test_h1_2_embodiment.py::T6.
+        # robots/h1_2.py exports H1_2_HEAD_EXTEND_CONFIG, which restores it as an
+        # augmented body while keeping dof_pos at 27. Left EMPTY for now because
+        # motion_lib_base.py:1506-1507 has the global_translation_extend
+        # consumption commented out upstream, so enabling it would widen
+        # num_bodies_augment (28 -> 29), and every aux-loss decoder/normalizer
+        # with it, while delivering no head data. Turn on together with that.
+        extend_config: []
+
+algo:
+  config:
+    empty_cache_every_n_ppo_epoch: -1
+    num_steps_per_env: 24
+    use_clampped_std: true
+    std_clamp_min: 0.001
+    std_clamp_max: 0.5
+    max_grad_norm: 0.1
+    actor:
+      backbone:
+        reencode_smpl_g1_recon: true
+        encoders:
+          g1:
+            inputs: ["command_multi_future_nonflat", "motion_anchor_ori_b_mf_nonflat"]
+          teleop:
+            inputs:
+              [
+                "command_multi_future_lower_body",
+                "vr_3point_local_target",
+                "vr_3point_local_orn_target",
+                "motion_anchor_ori_b",
+              ]
+          smpl:
+            inputs:
+              [
+                "smpl_joints_multi_future_local_nonflat",
+                "smpl_root_ori_b_multi_future",
+                "joint_pos_multi_future_wrist_for_smpl",
+              ]
+        decoders:
+          g1_kin:
+            outputs: ["command_multi_future_nonflat", "motion_anchor_ori_b_mf_nonflat"]
+
+    critic:
+      backbone:
+        module_config_dict:
+          layer_config:
+            hidden_dims: [2048, 2048, 1024, 1024, 512, 512]
