@@ -63,6 +63,7 @@ from gear_sonic.trl.utils.common import (
     materialize_lazy_params,
     wandb_run_exists,
 )
+from gear_sonic.utils import mps_stack, plant_proof
 from gear_sonic.utils.common import seeding
 from gear_sonic.utils.config_utils import register_rl_resolvers
 from gear_sonic.utils.obs_utils import get_group_term_obs_shape
@@ -156,6 +157,14 @@ def create_manager_env(config, device, args_cli):
 def main(config: OmegaConf):
     simulator_type = "IsaacSim"
     env_config = config.manager_env
+
+    # MUST be first: transformers' TrainingArguments.__post_init__ resolves
+    # self.device, which constructs accelerate's PartialState singleton with the
+    # default backend. First construction wins, so the gloo request that MPS
+    # rank-stacking depends on has to be made before PPOConfig is built.
+    _stack_shape = mps_stack.stack_shape()
+    _ddp_backend = mps_stack.init_distributed_early(_stack_shape)
+
     from transformers import HfArgumentParser
     from trl import ModelConfig, PPOConfig, ScriptArguments
 
@@ -180,10 +189,26 @@ def main(config: OmegaConf):
     import torch  # noqa: E402
 
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
-    kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=6000))
+    # NOTE: the process group is already up (init_distributed_early). This only
+    # carries the timeout; the backend here is a no-op on an initialised
+    # PartialState and is kept consistent so the two can never disagree.
+    kwargs = InitProcessGroupKwargs(backend=_ddp_backend, timeout=timedelta(seconds=6000))
     accelerator = Accelerator(
         gradient_accumulation_steps=training_args.gradient_accumulation_steps,
         kwargs_handlers=[ddp_kwargs, kwargs],
+    )
+
+    # Hard guard: `--num_processes` is only a request; the realised world size
+    # comes from the cluster environment and can silently collapse.
+    mps_stack.assert_world_size_matches_request(accelerator.num_processes, _stack_shape)
+    # transformers resets accelerate's state while building PPOConfig; re-check
+    # that the backend accelerate branches on still matches the real group.
+    mps_stack.assert_backend_intact(_stack_shape)
+    logger.info(
+        f"[mps_stack] n_gpu={_stack_shape.n_gpu} stack={_stack_shape.stack} "
+        f"world_size={accelerator.num_processes} "
+        f"backend={torch.distributed.get_backend() if torch.distributed.is_initialized() else 'none'} "
+        f"rank={accelerator.process_index} device={accelerator.device}"
     )
 
     device = str(accelerator.device)
@@ -270,9 +295,25 @@ def main(config: OmegaConf):
             "--/log/level=error --/log/fileLogLevel=error --/log/outputStreamLevel=error"
         )
 
+        # MPS rank-stacking: AppLauncher's distributed branch would set
+        # active_gpu/physics_gpu to cuda:$LOCAL_RANK, which overflows the GPU
+        # count as soon as world_size > n_gpus. Hand it the accelerate device
+        # instead and re-apply the CPU-thread caps that branch would have set.
+        _caps = mps_stack.configure_app_launcher_for_stack(
+            args_cli, device, accelerator.num_processes, _stack_shape
+        )
+        if _caps:
+            logger.info(
+                f"[mps_stack] AppLauncher device={args_cli.device} distributed=False "
+                f"thread_caps=omp:{_caps['OMP_NUM_THREADS']} tbb:{_caps['TBB_THREAD_COUNT']} "
+                f"carb:{_caps['carb']} kit_args={args_cli.kit_args!r}"
+            )
+
         # AppLauncher can't handle multiple processes creating it at the same time so we need a lock
         _lock_path = "/tmp/isaaclab_app_launcher.lock"
         _local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        # Keep the S co-located Kit/PhysX warm-ups from bunching up on one GPU.
+        mps_stack.stagger_boot(_local_rank, _stack_shape)
         with FileLock(_lock_path):
             app_launcher = AppLauncher(args_cli)
 
@@ -319,6 +360,29 @@ def main(config: OmegaConf):
     env_config.config.experiment_dir = str(Path(config.experiment_dir))
 
     env = create_manager_env(config, device, args_cli)
+
+    # PLANT PROOF: read the gains back out of the instantiated articulation and
+    # write them next to the config, so what PhysX is simulating is falsifiable
+    # from disk. An env var or a log line only proves what was *requested*.
+    if accelerator.is_main_process:
+        _plant_report = plant_proof.dump_plant(
+            env.env.scene["robot"], Path(config.experiment_dir) / "plant.yaml"
+        )
+        _plant_problems = _plant_report["mismatches_vs_production"]
+        if _plant_problems:
+            for _p in _plant_problems:
+                logger.error(f"[plant] {_p}")
+            if os.environ.get("SONIC_REQUIRE_PRODUCTION_PLANT", "0") == "1":
+                raise RuntimeError(
+                    f"{len(_plant_problems)} joint(s) do not carry the production H1-2 "
+                    "plant; see plant.yaml in the experiment dir. Refusing to train on "
+                    "the wrong robot (set SONIC_REQUIRE_PRODUCTION_PLANT=0 to override)."
+                )
+        else:
+            logger.info(
+                f"[plant] all {len(_plant_report['realised'])} joints carry the "
+                "production H1-2 plant (proof written to plant.yaml)"
+            )
     if config.get("replay", False):
         _save_video_path = config.get("replay_save_video", None)
         env.run_replay(
