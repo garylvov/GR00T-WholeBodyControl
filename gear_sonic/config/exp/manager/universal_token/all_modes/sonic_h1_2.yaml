@@ -36,8 +36,30 @@ critic_prop_history_length: 10
 critic_actions_history_length: 10
 
 manager_env:
+  observations:
+    # JOINT-INDEX OVERRIDE (embodiment correction, NOT a tuning choice).
+    # The shared tokenizer group `unitoken_all_noz` pulls in
+    # observations/terms/joint_pos_multi_future_wrist_for_smpl.yaml, which
+    # hardcodes G1's six wrist DOF indices [23, 24, 25, 26, 27, 28].  Those are
+    # right for G1 -- G1_ISAACLAB_JOINTS has 30 entries, so 29 DOF, and the
+    # wrists are the last six -- but on H1-2 they are OUT OF BOUNDS: H1-2 has
+    # 27 DOF, so 27 and 28 do not exist.  The result was a CUDA device-side
+    # `index out of bounds` assert raised from
+    # gear_sonic/envs/manager_env/mdp/observations.py:1587 during
+    # ObservationManager construction, i.e. before iteration 0 could run.
+    # H1-2's six wrist DOFs are likewise the trailing six, 21..26:
+    #     21 left_wrist_roll    22 right_wrist_roll
+    #     23 left_wrist_pitch   24 right_wrist_pitch
+    #     25 left_wrist_yaw     26 right_wrist_yaw
+    # DOF index = index in H1_2_ISAACLAB_JOINTS - 1, because entry 0 is the
+    # root `pelvis`, which owns no DOF.  Same rule reproduces G1's [23..28].
+    # Guarded by tests/test_h1_2_embodiment.py::test_wrist_joints_idx_in_range.
+    tokenizer:
+      joint_pos_multi_future_wrist_for_smpl:
+        params:
+          joints_idx: [21, 22, 23, 24, 25, 26]
   rewards:
-    # BODY-NAME OVERRIDE (the only one H1-2 needs).
+    # BODY-NAME OVERRIDE (rewards need exactly one; see also `observations` above).
     # The shared term defaults to ["left_wrist_yaw_link", "right_wrist_yaw_link",
     # "head_link"].  H1-2 has no head link at all: its head is a fixed collision
     # capsule welded to torso_link, so torso_link's angular velocity *is* the

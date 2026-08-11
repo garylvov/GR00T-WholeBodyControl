@@ -228,6 +228,76 @@ def compare(a: dict, b: dict, names, label: str, verbose_names=()):
 
 # --------------------------------------------------------------------------- #
 
+def _t7(il_bodies: list, n_dof: int) -> None:
+    """Every hardcoded joint index the H1-2 experiment uses must be in range.
+
+    The shared observation term
+    ``config/manager_env/observations/terms/joint_pos_multi_future_wrist_for_smpl.yaml``
+    hardcodes G1's six wrist DOF indices ``[23, 24, 25, 26, 27, 28]``.  G1 has
+    29 DOF so those are its trailing six; H1-2 has 27, so 27 and 28 are off the
+    end.  Nothing type-checks this -- it surfaced only as a CUDA device-side
+    ``index out of bounds`` assert thrown from observations.py during
+    ObservationManager construction, which is both late and unreadable.
+
+    So: parse the indices the H1-2 experiment actually composes, and check them
+    against the embodiment tables re-derived in main().  Also assert they name
+    the six wrist DOFs, so a merely in-range but wrong list still fails.
+    """
+    import yaml  # noqa: PLC0415
+
+    exp = REPO_ROOT / (
+        "gear_sonic/config/exp/manager/universal_token/all_modes/sonic_h1_2.yaml"
+    )
+    shared = REPO_ROOT / (
+        "gear_sonic/config/manager_env/observations/terms/"
+        "joint_pos_multi_future_wrist_for_smpl.yaml"
+    )
+    cfg = yaml.safe_load(exp.read_text())
+    idx = (
+        cfg.get("manager_env", {})
+        .get("observations", {})
+        .get("tokenizer", {})
+        .get("joint_pos_multi_future_wrist_for_smpl", {})
+        .get("params", {})
+        .get("joints_idx")
+    )
+    check(
+        idx is not None,
+        "sonic_h1_2.yaml overrides joint_pos_multi_future_wrist_for_smpl.joints_idx "
+        "(the shared G1 default is out of bounds on H1-2)",
+    )
+    if idx is None:
+        return
+
+    check(
+        all(0 <= i < n_dof for i in idx),
+        f"all H1-2 wrist joints_idx in [0, {n_dof}): {idx}",
+    )
+
+    # DOF index = body index - 1; entry 0 of H1_2_ISAACLAB_JOINTS is the root.
+    expected = [il_bodies.index(n) - 1 for n in (
+        "left_wrist_roll_link", "right_wrist_roll_link",
+        "left_wrist_pitch_link", "right_wrist_pitch_link",
+        "left_wrist_yaw_link", "right_wrist_yaw_link",
+    )]
+    check(
+        list(idx) == expected,
+        f"H1-2 wrist joints_idx names the six wrist DOFs in the shared term's "
+        f"order (expected {expected}, got {list(idx)})",
+    )
+
+    # Guard the premise: the shared default really is G1's and really is unusable
+    # here, so this override is not cargo-culted and must not be quietly dropped.
+    g1_idx = yaml.safe_load(shared.read_text())[
+        "joint_pos_multi_future_wrist_for_smpl"
+    ]["params"]["joints_idx"]
+    check(
+        any(i >= n_dof for i in g1_idx),
+        f"shared G1 default {g1_idx} is out of range for H1-2's {n_dof} DOF, "
+        "which is why the override exists",
+    )
+
+
 def _t6() -> None:
     """SONIC's Humanoid_Batch must yield a 27-wide dof_pos for H1-2.
 
@@ -449,6 +519,9 @@ def main() -> int:
 
     print("\n=== T6: Humanoid_Batch dof_pos width (head_aux / extend_config) ===")
     _t6()
+
+    print("\n=== T7: hardcoded wrist joint indices are in range for H1-2 ===")
+    _t7(il_bodies, n_dof)
 
     print("\n" + "=" * 72)
     if _FAILURES:
